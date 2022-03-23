@@ -92,7 +92,7 @@ func getFlinkAPIBaseURL(cluster *v1beta1.FlinkCluster) string {
 		*cluster.Spec.JobManager.Ports.UI)
 }
 
-// Gets JobManager ingress name
+// Gets ConfigMap name
 func getConfigMapName(clusterName string) string {
 	return clusterName + "-configmap"
 }
@@ -112,7 +112,7 @@ func getJobManagerIngressName(clusterName string) string {
 	return clusterName + "-jobmanager"
 }
 
-// Gets TaskManager name
+// Gets TaskManager StatefulSet name
 func getTaskManagerStatefulSetName(clusterName string) string {
 	return clusterName + "-taskmanager"
 }
@@ -143,24 +143,24 @@ func (tc *TimeConverter) ToString(timestamp time.Time) string {
 	return timestamp.Format(time.RFC3339)
 }
 
-// setTimestamp sets the current timestamp to the target.
-func setTimestamp(target *string) {
+// SetTimestamp sets the current timestamp to the target.
+func SetTimestamp(target *string) {
 	var tc = &TimeConverter{}
 	var now = time.Now()
 	*target = tc.ToString(now)
 }
 
-func getTime(timeStr string) time.Time {
+func GetTime(timeStr string) time.Time {
 	var tc TimeConverter
 	return tc.FromString(timeStr)
 }
 
-func isBlank(s *string) bool {
+func IsBlank(s *string) bool {
 	return s == nil || strings.TrimSpace(*s) == ""
 }
 
 // Checks whether it is possible to take savepoint.
-func canTakeSavepoint(cluster v1beta1.FlinkCluster) bool {
+func canTakeSavepoint(cluster *v1beta1.FlinkCluster) bool {
 	var jobSpec = cluster.Spec.Job
 	var savepointStatus = cluster.Status.Savepoint
 	var job = cluster.Status.Components.Job
@@ -292,7 +292,7 @@ func getControlStatus(controlName string, state string) *v1beta1.FlinkClusterCon
 	var controlStatus = new(v1beta1.FlinkClusterControlStatus)
 	controlStatus.Name = controlName
 	controlStatus.State = state
-	setTimestamp(&controlStatus.UpdateTime)
+	SetTimestamp(&controlStatus.UpdateTime)
 	return controlStatus
 }
 

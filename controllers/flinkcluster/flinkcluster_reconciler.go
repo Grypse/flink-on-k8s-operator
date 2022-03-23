@@ -132,7 +132,7 @@ func (reconciler *ClusterReconciler) reconcileBatchScheduler() error {
 	options := schedulerTypes.SchedulerOptions{
 		ClusterName:       cluster.Name,
 		ClusterNamespace:  cluster.Namespace,
-		Queue:             schedulerSpec.PriorityClassName,
+		Queue:             schedulerSpec.Queue,
 		PriorityClassName: schedulerSpec.PriorityClassName,
 		OwnerReferences:   []metav1.OwnerReference{ToOwnerReference(cluster)},
 	}
@@ -572,7 +572,7 @@ func (reconciler *ClusterReconciler) reconcileJob() (ctrl.Result, error) {
 		if recorded.Revision.IsUpdateTriggered() {
 			log.Info("Preparing job update")
 			var takeSavepoint = jobSpec.TakeSavepointOnUpdate == nil || *jobSpec.TakeSavepointOnUpdate
-			var shouldSuspend = takeSavepoint && isBlank(jobSpec.FromSavepoint)
+			var shouldSuspend = takeSavepoint && IsBlank(jobSpec.FromSavepoint)
 			if shouldSuspend {
 				newSavepointStatus, err = reconciler.trySuspendJob()
 			} else if shouldUpdateJob(&observed) {
@@ -666,7 +666,7 @@ func (reconciler *ClusterReconciler) trySuspendJob() (*v1beta1.SavepointStatus, 
 	var log = reconciler.log
 	var recorded = reconciler.observed.cluster.Status
 
-	if !canTakeSavepoint(*reconciler.observed.cluster) {
+	if !canTakeSavepoint(reconciler.observed.cluster) {
 		return nil, nil
 	}
 
@@ -753,7 +753,7 @@ func (reconciler *ClusterReconciler) cancelJobs(
 // Takes a savepoint if possible then stops the job.
 func (reconciler *ClusterReconciler) cancelFlinkJob(jobID string, takeSavepoint bool) error {
 	var log = reconciler.log
-	if takeSavepoint && canTakeSavepoint(*reconciler.observed.cluster) {
+	if takeSavepoint && canTakeSavepoint(reconciler.observed.cluster) {
 		log.Info("Taking savepoint before stopping job", "jobID", jobID)
 		var err = reconciler.takeSavepoint(jobID)
 		if err != nil {
@@ -802,7 +802,7 @@ func (reconciler *ClusterReconciler) shouldTakeSavepoint() v1beta1.SavepointReas
 	var savepoint = observed.cluster.Status.Savepoint
 	var newRequestedControl = getNewControlRequest(cluster)
 
-	if !canTakeSavepoint(*reconciler.observed.cluster) {
+	if !canTakeSavepoint(reconciler.observed.cluster) {
 		return ""
 	}
 
@@ -826,7 +826,7 @@ func (reconciler *ClusterReconciler) shouldTakeSavepoint() v1beta1.SavepointReas
 	case jobSpec.AutoSavepointSeconds != nil:
 		// When previous try was failed, check retry interval.
 		if savepoint.IsFailed() && savepoint.TriggerReason == v1beta1.SavepointReasonScheduled {
-			var nextRetryTime = getTime(savepoint.UpdateTime).Add(SavepointRetryIntervalSeconds * time.Second)
+			var nextRetryTime = GetTime(savepoint.UpdateTime).Add(SavepointRetryIntervalSeconds * time.Second)
 			if time.Now().After(nextRetryTime) {
 				return v1beta1.SavepointReasonScheduled
 			} else {
@@ -931,7 +931,7 @@ func (reconciler *ClusterReconciler) updateStatus(
 		if controlStatus != nil {
 			newStatus.Control = controlStatus
 		}
-		setTimestamp(&newStatus.LastUpdateTime)
+		SetTimestamp(&newStatus.LastUpdateTime)
 		log.Info("Updating cluster status", "clusterClone", clusterClone, "newStatus", newStatus)
 		statusUpdateErr = reconciler.k8sClient.Status().Update(reconciler.context, clusterClone)
 		if statusUpdateErr == nil {
@@ -966,8 +966,8 @@ func (reconciler *ClusterReconciler) updateJobDeployStatus() error {
 	newJob.CompletionTime = nil
 
 	// Mark as job submitter is deployed.
-	setTimestamp(&newJob.DeployTime)
-	setTimestamp(&clusterClone.Status.LastUpdateTime)
+	SetTimestamp(&newJob.DeployTime)
+	SetTimestamp(&clusterClone.Status.LastUpdateTime)
 
 	// Latest savepoint location should be fromSavepoint.
 	var fromSavepoint = getFromSavepoint(desiredJobSubmitter.Spec)
@@ -992,7 +992,7 @@ func (reconciler *ClusterReconciler) getNewSavepointStatus(triggerID string, tri
 	var jobID = reconciler.getFlinkJobID()
 	var savepointState string
 	var now string
-	setTimestamp(&now)
+	SetTimestamp(&now)
 
 	if triggerSuccess {
 		savepointState = v1beta1.SavepointStateInProgress

@@ -103,11 +103,15 @@ func getDesiredClusterState(observed *ObservedClusterState) *model.DesiredCluste
 		state.JmIngress = newJobManagerIngress(cluster)
 	}
 
-	jobStatus := cluster.Status.Components.Job
-	keepJobState := (shouldStopJob(cluster) || jobStatus.IsStopped()) &&
-		(!shouldUpdateJob(observed) && !jobStatus.ShouldRestart(jobSpec))
-	if jobSpec != nil && !keepJobState {
-		state.Job = newJob(cluster)
+	if jobSpec != nil {
+		jobStatus := cluster.Status.Components.Job
+
+		keepJobState := (shouldStopJob(cluster) || jobStatus.IsStopped()) &&
+			(!shouldUpdateJob(observed) && !jobStatus.ShouldRestart(jobSpec))
+
+		if !keepJobState {
+			state.Job = newJob(cluster)
+		}
 	}
 
 	return state
@@ -205,7 +209,7 @@ func newJobManagerPodSpec(mainContainer *corev1.Container, flinkCluster *v1beta1
 func newJobManagerStatefulSet(flinkCluster *v1beta1.FlinkCluster) *appsv1.StatefulSet {
 	var jobManagerSpec = flinkCluster.Spec.JobManager
 	var jobManagerStatefulSetName = getJobManagerStatefulSetName(flinkCluster.Name)
-	var podLabels = getComponentLabels(*flinkCluster, "jobmanager")
+	var podLabels = getComponentLabels(flinkCluster, "jobmanager")
 	podLabels = mergeLabels(podLabels, jobManagerSpec.PodLabels)
 	var statefulSetLabels = mergeLabels(podLabels, getRevisionHashLabels(&flinkCluster.Status.Revision))
 
@@ -266,19 +270,22 @@ func newJobManagerService(flinkCluster *v1beta1.FlinkCluster) *corev1.Service {
 		Port:       *jobManagerSpec.Ports.UI,
 		TargetPort: intstr.FromString("ui")}
 	var jobManagerServiceName = getJobManagerServiceName(clusterName)
-	var podLabels = getComponentLabels(*flinkCluster, "jobmanager")
-	podLabels = mergeLabels(podLabels, jobManagerSpec.PodLabels)
-	var serviceLabels = mergeLabels(podLabels, getRevisionHashLabels(&flinkCluster.Status.Revision))
+	selectorLabels := getComponentLabels(flinkCluster, "jobmanager")
+	serviceLabels := mergeLabels(selectorLabels, getRevisionHashLabels(&flinkCluster.Status.Revision))
+	serviceLabels = mergeLabels(serviceLabels, jobManagerSpec.ServiceLabels)
+	var serviceAnnotations = jobManagerSpec.ServiceAnnotations
+
 	var jobManagerService = &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: clusterNamespace,
 			Name:      jobManagerServiceName,
 			OwnerReferences: []metav1.OwnerReference{
 				ToOwnerReference(flinkCluster)},
-			Labels: serviceLabels,
+			Labels:      serviceLabels,
+			Annotations: serviceAnnotations,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: podLabels,
+			Selector: selectorLabels,
 			Ports:    []corev1.ServicePort{rpcPort, blobPort, queryPort, uiPort},
 		},
 	}
@@ -290,11 +297,11 @@ func newJobManagerService(flinkCluster *v1beta1.FlinkCluster) *corev1.Service {
 		jobManagerService.Spec.Type = corev1.ServiceTypeClusterIP
 	case v1beta1.AccessScopeVPC:
 		jobManagerService.Spec.Type = corev1.ServiceTypeLoadBalancer
-		jobManagerService.Annotations =
+		jobManagerService.Annotations = mergeLabels(serviceAnnotations,
 			map[string]string{
 				"networking.gke.io/load-balancer-type":                         "Internal",
 				"networking.gke.io/internal-load-balancer-allow-global-access": "true",
-			}
+			})
 	case v1beta1.AccessScopeExternal:
 		jobManagerService.Spec.Type = corev1.ServiceTypeLoadBalancer
 	case v1beta1.AccessScopeNodePort:
@@ -328,7 +335,7 @@ func newJobManagerIngress(
 	var ingressHost string
 	var ingressTLS []networkingv1.IngressTLS
 	var labels = mergeLabels(
-		getComponentLabels(*flinkCluster, "jobmanager"),
+		getComponentLabels(flinkCluster, "jobmanager"),
 		getRevisionHashLabels(&flinkCluster.Status.Revision))
 	var pathType = networkingv1.PathTypePrefix
 	if jobManagerIngressSpec.HostFormat != nil {
@@ -475,7 +482,7 @@ func newTaskManagerPodSpec(mainContainer *corev1.Container, flinkCluster *v1beta
 func newTaskManagerStatefulSet(flinkCluster *v1beta1.FlinkCluster) *appsv1.StatefulSet {
 	var taskManagerSpec = flinkCluster.Spec.TaskManager
 	var taskManagerStatefulSetName = getTaskManagerStatefulSetName(flinkCluster.Name)
-	var podLabels = getComponentLabels(*flinkCluster, "taskmanager")
+	var podLabels = getComponentLabels(flinkCluster, "taskmanager")
 	podLabels = mergeLabels(podLabels, taskManagerSpec.PodLabels)
 	var statefulSetLabels = mergeLabels(podLabels, getRevisionHashLabels(&flinkCluster.Status.Revision))
 
@@ -526,7 +533,7 @@ func newConfigMap(flinkCluster *v1beta1.FlinkCluster) *corev1.ConfigMap {
 	var tmPorts = flinkCluster.Spec.TaskManager.Ports
 	var configMapName = getConfigMapName(clusterName)
 	var labels = mergeLabels(
-		getClusterLabels(*flinkCluster),
+		getClusterLabels(flinkCluster),
 		getRevisionHashLabels(&flinkCluster.Status.Revision))
 	// Properties which should be provided from real deployed environment.
 	var flinkProps = map[string]string{
@@ -596,7 +603,7 @@ func newJobSubmitterPodSpec(flinkCluster *v1beta1.FlinkCluster) *corev1.PodSpec 
 	var serviceAccount = clusterSpec.ServiceAccountName
 	var jobManagerSpec = clusterSpec.JobManager
 	var clusterName = flinkCluster.Name
-	var jobManagerServiceName = clusterName + "-jobmanager"
+	var jobManagerServiceName = getJobManagerServiceName(clusterName)
 	var jobManagerAddress = fmt.Sprintf(
 		"%s:%d", jobManagerServiceName, *jobManagerSpec.Ports.UI)
 
@@ -701,7 +708,7 @@ func newJob(flinkCluster *v1beta1.FlinkCluster) *batchv1.Job {
 
 	recorded := flinkCluster.Status
 	jobManagerSpec := flinkCluster.Spec.JobManager
-	labels := getClusterLabels(*flinkCluster)
+	labels := getClusterLabels(flinkCluster)
 	labels = mergeLabels(labels, getRevisionHashLabels(&recorded.Revision))
 
 	var jobName string
@@ -709,7 +716,7 @@ func newJob(flinkCluster *v1beta1.FlinkCluster) *batchv1.Job {
 	var podSpec *corev1.PodSpec
 
 	if IsApplicationModeCluster(flinkCluster) {
-		labels = mergeLabels(labels, getComponentLabels(*flinkCluster, "jobmanager"))
+		labels = mergeLabels(labels, getComponentLabels(flinkCluster, "jobmanager"))
 		labels = mergeLabels(labels, jobManagerSpec.PodLabels)
 		labels = mergeLabels(labels, map[string]string{
 			"job-id": flink.GenJobId(flinkCluster.Namespace, flinkCluster.Name),
@@ -768,12 +775,12 @@ func convertFromSavepoint(jobSpec *v1beta1.JobSpec, jobStatus *v1beta1.JobStatus
 	switch {
 	// Creating for the first time
 	case jobStatus == nil:
-		if !isBlank(jobSpec.FromSavepoint) {
+		if !IsBlank(jobSpec.FromSavepoint) {
 			return jobSpec.FromSavepoint
 		}
 		return nil
 	// Updating with FromSavepoint provided
-	case revision.IsUpdateTriggered() && !isBlank(jobSpec.FromSavepoint):
+	case revision.IsUpdateTriggered() && !IsBlank(jobSpec.FromSavepoint):
 		return jobSpec.FromSavepoint
 	// Latest savepoint
 	case jobStatus.SavepointLocation != "":
@@ -819,13 +826,6 @@ func appendVolumeMounts(volumeMounts []corev1.VolumeMount, newVolumeMounts ...co
 	return volumeMounts
 }
 
-func addEnvVar(envVars []corev1.EnvVar, name, value string) []corev1.EnvVar {
-	return appendEnvVars(envVars, corev1.EnvVar{
-		Name:  name,
-		Value: value,
-	})
-}
-
 func appendEnvVars(envVars []corev1.EnvVar, newEnvVars ...corev1.EnvVar) []corev1.EnvVar {
 	for _, envVar := range newEnvVars {
 		var conflict = false
@@ -843,7 +843,7 @@ func appendEnvVars(envVars []corev1.EnvVar, newEnvVars ...corev1.EnvVar) []corev
 	return envVars
 }
 
-// Copy any non-duplicate volume mounts and env vars to the specified containers
+// Copy any non-duplicate volume mounts and env vars to each specified container
 func convertContainer(container corev1.Container, volumeMounts []corev1.VolumeMount, envVars []corev1.EnvVar) corev1.Container {
 	container.VolumeMounts = appendVolumeMounts(container.VolumeMounts, volumeMounts...)
 	container.Env = appendEnvVars(container.Env, envVars...)
@@ -851,7 +851,7 @@ func convertContainer(container corev1.Container, volumeMounts []corev1.VolumeMo
 	return container
 }
 
-// Copy any non-duplicate volume mounts and env vars to each specified container
+// Copy any non-duplicate volume mounts and env vars to the specified containers
 func convertContainers(containers []corev1.Container, volumeMounts []corev1.VolumeMount, envVars []corev1.EnvVar) []corev1.Container {
 	var updatedContainers = []corev1.Container{}
 	for _, container := range containers {
@@ -1158,7 +1158,7 @@ func setGCPConfig(gcpConfig *v1beta1.GCPConfig, podSpec *corev1.PodSpec) bool {
 	return true
 }
 
-func getClusterLabels(cluster v1beta1.FlinkCluster) map[string]string {
+func getClusterLabels(cluster *v1beta1.FlinkCluster) map[string]string {
 	return map[string]string{
 		"cluster": cluster.Name,
 		"app":     "flink",
@@ -1173,7 +1173,7 @@ func getServiceAccountName(serviceAccount *string) string {
 	return ""
 }
 
-func getComponentLabels(cluster v1beta1.FlinkCluster, component string) map[string]string {
+func getComponentLabels(cluster *v1beta1.FlinkCluster, component string) map[string]string {
 	return mergeLabels(getClusterLabels(cluster), map[string]string{
 		"component": component,
 	})
@@ -1242,6 +1242,9 @@ func getLogConf(spec v1beta1.FlinkClusterSpec) map[string]string {
 	}
 	if _, isPresent := result["log4j-console.properties"]; !isPresent {
 		result["log4j-console.properties"] = DefaultLog4jConfig
+	}
+	if _, isPresent := result["log4j-cli.properties"]; !isPresent {
+		result["log4j-cli.properties"] = DefaultLog4jConfig
 	}
 	if _, isPresent := result["logback-console.xml"]; !isPresent {
 		result["logback-console.xml"] = DefaultLogbackConfig

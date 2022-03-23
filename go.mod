@@ -4,7 +4,7 @@ go 1.17
 
 require (
 	github.com/davecgh/go-spew v1.1.1
-	github.com/go-logr/logr v1.2.0
+	github.com/go-logr/logr v1.2.3
 	github.com/google/go-cmp v0.5.7
 	github.com/hashicorp/go-version v1.4.0
 	github.com/imdario/mergo v0.3.12
@@ -12,9 +12,9 @@ require (
 	github.com/onsi/gomega v1.18.1
 	golang.org/x/net v0.0.0-20211209124913-491a49abca63
 	gotest.tools/v3 v3.1.0
-	k8s.io/api v0.23.4
-	k8s.io/apimachinery v0.23.4
-	k8s.io/client-go v0.23.4
+	k8s.io/api v0.23.5
+	k8s.io/apimachinery v0.23.5
+	k8s.io/client-go v0.23.5
 	k8s.io/klog v1.0.0
 	sigs.k8s.io/controller-runtime v0.11.1
 	volcano.sh/apis v0.0.0-20210924061932-d4408f25a528
