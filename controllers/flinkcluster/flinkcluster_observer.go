@@ -26,10 +26,12 @@ import (
 	v1beta1 "github.com/spotify/flink-on-k8s-operator/apis/flinkcluster/v1beta1"
 	"github.com/spotify/flink-on-k8s-operator/internal/controllers/history"
 	flink "github.com/spotify/flink-on-k8s-operator/internal/flink"
+	"github.com/spotify/flink-on-k8s-operator/internal/util"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -57,6 +59,7 @@ type ObservedClusterState struct {
 	jmService              *corev1.Service
 	jmIngress              *networkingv1.Ingress
 	tmStatefulSet          *appsv1.StatefulSet
+	podDisruptionBudget    *policyv1.PodDisruptionBudget
 	persistentVolumeClaims *corev1.PersistentVolumeClaimList
 	flinkJob               FlinkJob
 	flinkJobSubmitter      FlinkJobSubmitter
@@ -172,6 +175,21 @@ func (observer *ClusterStateObserver) observe(
 	} else {
 		log.Info("Observed configMap", "state", *observedConfigMap)
 		observed.configMap = observedConfigMap
+	}
+
+	// PodDisruptionBudget.
+	var observedPodDisruptionBudget = new(policyv1.PodDisruptionBudget)
+	err = observer.observePodDisruptionBudget(observedPodDisruptionBudget)
+	if err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			log.Error(err, "Failed to get PodDisruptionBudget")
+			return err
+		}
+		log.Info("Observed PodDisruptionBudget", "state", "nil")
+		observedPodDisruptionBudget = nil
+	} else {
+		log.Info("Observed PodDisruptionBudget", "state", *observedPodDisruptionBudget)
+		observed.podDisruptionBudget = observedPodDisruptionBudget
 	}
 
 	// JobManager StatefulSet.
@@ -366,24 +384,28 @@ func (observer *ClusterStateObserver) observeFlinkJobStatus(observed *ObservedCl
 			flinkJobsUnexpected = append(flinkJobsUnexpected, job.Id)
 		}
 	}
-
-	flinkJobExceptions, err := observer.flinkClient.GetJobExceptions(flinkAPIBaseURL, flinkJobID)
-	if err != nil {
-		// It is normal in many cases, not an error.
-		log.Info("Failed to get Flink job exceptions.", "error", err)
-		return
-	}
-	log.Info("Observed Flink job exceptions", "jobs", flinkJobExceptions)
-	flinkJob.exceptions = flinkJobExceptions
-
 	flinkJob.status = flinkJobStatus
 	flinkJob.unexpected = flinkJobsUnexpected
+
 	log.Info("Observed Flink job",
 		"submitted job status", flinkJob.status,
 		"all job list", flinkJob.list,
 		"unexpected job list", flinkJob.unexpected)
 	if len(flinkJobsUnexpected) > 0 {
 		log.Info("More than one unexpected Flink job were found!")
+	}
+
+	if flinkJobID == "" {
+		log.Info("No flinkJobID given. Skipping get exceptions")
+	} else {
+		flinkJobExceptions, err := observer.flinkClient.GetJobExceptions(flinkAPIBaseURL, flinkJobID)
+		if err != nil {
+			// It is normal in many cases, not an error.
+			log.Info("Failed to get Flink job exceptions.", "error", err)
+		} else {
+			log.Info("Observed Flink job exceptions", "jobs", flinkJobExceptions)
+			flinkJob.exceptions = flinkJobExceptions
+		}
 	}
 }
 
@@ -424,6 +446,20 @@ func (observer *ClusterStateObserver) observeRevisions(
 	*revisions = append(*revisions, controllerRevisions...)
 
 	return err
+}
+
+func (observer *ClusterStateObserver) observePodDisruptionBudget(
+	observedPodDisruptionBudget *policyv1.PodDisruptionBudget) error {
+	var clusterNamespace = observer.request.Namespace
+	var clusterName = observer.request.Name
+
+	return observer.k8sClient.Get(
+		observer.context,
+		types.NamespacedName{
+			Namespace: clusterNamespace,
+			Name:      getPodDisruptionBudgetName(clusterName),
+		},
+		observedPodDisruptionBudget)
 }
 
 func (observer *ClusterStateObserver) observeConfigMap(
@@ -567,7 +603,7 @@ func (observer *ClusterStateObserver) observePersistentVolumeClaims(
 		}
 		log.Info("Observed persistent volume claim list", "state", "nil")
 	} else {
-		log.Info("Observed persistent volume claim list", "state", *observedClaims)
+		log.Info("Observed persistent volume claim list", "state", len(observedClaims.Items))
 	}
 
 	return nil
@@ -604,7 +640,7 @@ func (observer *ClusterStateObserver) syncRevisionStatus(observed *ObservedClust
 	}
 
 	// create a new revision from the current cluster
-	nextRevision, err := newRevision(cluster, getNextRevisionNumber(revisions), &collisionCount)
+	nextRevision, err := newRevision(cluster, util.GetNextRevisionNumber(revisions), &collisionCount)
 	if err != nil {
 		return err
 	}
@@ -675,7 +711,7 @@ func (observer *ClusterStateObserver) truncateHistory(observed *ObservedClusterS
 		historyLimit = 10
 	}
 
-	nonLiveHistory := getNonLiveHistory(revisions, historyLimit)
+	nonLiveHistory := util.GetNonLiveHistory(revisions, historyLimit)
 
 	// delete any non-live history to maintain the revision limit.
 	for i := 0; i < len(nonLiveHistory); i++ {

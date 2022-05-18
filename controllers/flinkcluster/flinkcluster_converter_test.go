@@ -58,7 +58,7 @@ func TestGetDesiredClusterState(t *testing.T) {
 	var jobMode v1beta1.JobMode = v1beta1.JobModeDetached
 	var jobBackoffLimit int32 = 0
 	var jmReadinessProbe = corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
+		Handler: corev1.Handler{
 			TCPSocket: &corev1.TCPSocketAction{
 				Port: intstr.FromInt(int(jmRPCPort)),
 			},
@@ -69,7 +69,7 @@ func TestGetDesiredClusterState(t *testing.T) {
 		FailureThreshold:    60,
 	}
 	var jmLivenessProbe = corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
+		Handler: corev1.Handler{
 			TCPSocket: &corev1.TCPSocketAction{
 				Port: intstr.FromInt(int(jmRPCPort)),
 			},
@@ -80,7 +80,7 @@ func TestGetDesiredClusterState(t *testing.T) {
 		FailureThreshold:    5,
 	}
 	var tmReadinessProbe = corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
+		Handler: corev1.Handler{
 			TCPSocket: &corev1.TCPSocketAction{
 				Port: intstr.FromInt(int(tmRPCPort)),
 			},
@@ -91,7 +91,7 @@ func TestGetDesiredClusterState(t *testing.T) {
 		FailureThreshold:    60,
 	}
 	var tmLivenessProbe = corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
+		Handler: corev1.Handler{
 			TCPSocket: &corev1.TCPSocketAction{
 				Port: intstr.FromInt(int(tmRPCPort)),
 			},
@@ -422,7 +422,7 @@ func TestGetDesiredClusterState(t *testing.T) {
 								},
 							},
 							Lifecycle: &corev1.Lifecycle{
-								PreStop: &corev1.LifecycleHandler{
+								PreStop: &corev1.Handler{
 									Exec: &corev1.ExecAction{
 										Command: []string{"sleep", strconv.Itoa(preStopSleepSeconds)},
 									},
@@ -730,7 +730,7 @@ func TestGetDesiredClusterState(t *testing.T) {
 								},
 							},
 							Lifecycle: &corev1.Lifecycle{
-								PreStop: &corev1.LifecycleHandler{
+								PreStop: &corev1.Handler{
 									Exec: &corev1.ExecAction{
 										Command: []string{"sleep", strconv.Itoa(preStopSleepSeconds)},
 									},
@@ -1344,4 +1344,87 @@ func Test_getLogConf(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClassPath(t *testing.T) {
+	var jmRPCPort int32 = 6123
+	var jmBlobPort int32 = 6124
+	var jmQueryPort int32 = 6125
+	var jmUIPort int32 = 8081
+	var tmDataPort int32 = 6121
+	var tmRPCPort int32 = 6122
+	var tmQueryPort int32 = 6125
+	var tmReplicas int32 = v1beta1.DefaultTaskManagerReplicas
+
+	var jobMode v1beta1.JobMode = v1beta1.JobModeDetached
+	var jarFile = "/cache/my-job.jar"
+	var className = "org.apache.flink.examples.java.wordcount.WordCount"
+	var parallelism int32 = 3
+
+	// Provided security context
+	var observed = &ObservedClusterState{
+		cluster: &v1beta1.FlinkCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "flinkjobcluster-sample",
+				Namespace: "default",
+			},
+			Spec: v1beta1.FlinkClusterSpec{
+				Job: &v1beta1.JobSpec{
+					Mode: &jobMode,
+					ClassPath: []string{
+						"gs://bucketname/staging/grpc-stub-1.41.1-B66xkeEg13eE_nKyL0lylg.jar",
+						"gs://bucketname/staging/better-files_2.12-3.8.0-1q2TM0GQpc7_Sq5wOwjsgw.jar",
+						"gs://bucketname/staging/opencsv-2.3-nuurqgB9wymEXlqzwStOaw.jar",
+						"gs://bucketname/staging/scio-parquet_2.12-0.11.4-iG_V62XRj-25MYxrNRj-Sg.jar",
+						"gs://bucketname/staging/slf4j-jdk14-1.7.33-iTAADCGj87621OCVYpg-8w.jar",
+					},
+					Args:        []string{"--input", "./README.txt"},
+					ClassName:   &className,
+					JarFile:     &jarFile,
+					Parallelism: &parallelism,
+				},
+				JobManager: &v1beta1.JobManagerSpec{
+					AccessScope: v1beta1.AccessScopeVPC,
+					Ports: v1beta1.JobManagerPorts{
+						RPC:   &jmRPCPort,
+						Blob:  &jmBlobPort,
+						Query: &jmQueryPort,
+						UI:    &jmUIPort,
+					},
+				},
+				TaskManager: &v1beta1.TaskManagerSpec{
+					Replicas: &tmReplicas,
+					Ports: v1beta1.TaskManagerPorts{
+						Data:  &tmDataPort,
+						RPC:   &tmRPCPort,
+						Query: &tmQueryPort,
+					},
+				},
+			},
+			Status: v1beta1.FlinkClusterStatus{
+				Revision: v1beta1.RevisionStatus{NextRevision: "flinkjobcluster-sample-85dc8f749-1"},
+			},
+		},
+	}
+
+	var desired = getDesiredClusterState(observed)
+
+	expectedArgs := []string{
+		"bash", "/opt/flink-operator/submit-job.sh",
+		"--jobmanager", "flinkjobcluster-sample-jobmanager:8081",
+		"--class", className,
+		"--parallelism", strconv.FormatInt(int64(parallelism), 10),
+		"--detached",
+		"-C", "gs://bucketname/staging/grpc-stub-1.41.1-B66xkeEg13eE_nKyL0lylg.jar",
+		"-C", "gs://bucketname/staging/better-files_2.12-3.8.0-1q2TM0GQpc7_Sq5wOwjsgw.jar",
+		"-C", "gs://bucketname/staging/opencsv-2.3-nuurqgB9wymEXlqzwStOaw.jar",
+		"-C", "gs://bucketname/staging/scio-parquet_2.12-0.11.4-iG_V62XRj-25MYxrNRj-Sg.jar",
+		"-C", "gs://bucketname/staging/slf4j-jdk14-1.7.33-iTAADCGj87621OCVYpg-8w.jar",
+		jarFile,
+		"--input", "./README.txt",
+	}
+
+	args := desired.Job.Spec.Template.Spec.Containers[0].Args
+
+	assert.DeepEqual(t, args, expectedArgs)
 }

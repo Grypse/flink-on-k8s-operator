@@ -18,10 +18,8 @@ package flinkcluster
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"regexp"
 	"strconv"
@@ -29,6 +27,7 @@ import (
 	"time"
 
 	"github.com/spotify/flink-on-k8s-operator/internal/flink"
+	"github.com/spotify/flink-on-k8s-operator/internal/util"
 
 	v1beta1 "github.com/spotify/flink-on-k8s-operator/apis/flinkcluster/v1beta1"
 	"github.com/spotify/flink-on-k8s-operator/internal/controllers/history"
@@ -36,6 +35,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -97,6 +97,11 @@ func getConfigMapName(clusterName string) string {
 	return clusterName + "-configmap"
 }
 
+// Gets PodDisruptionBudgetName name
+func getPodDisruptionBudgetName(clusterName string) string {
+	return "flink-" + clusterName
+}
+
 // Gets JobManager StatefulSet name
 func getJobManagerStatefulSetName(clusterName string) string {
 	return clusterName + "-jobmanager"
@@ -123,40 +128,6 @@ func getJobManagerJobName(clusterName string) string {
 
 func getSubmitterJobName(clusterName string) string {
 	return clusterName + "-job-submitter"
-}
-
-// TimeConverter converts between time.Time and string.
-type TimeConverter struct{}
-
-// FromString converts string to time.Time.
-func (tc *TimeConverter) FromString(timeStr string) time.Time {
-	timestamp, err := time.Parse(
-		time.RFC3339, timeStr)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to parse time string: %s", timeStr))
-	}
-	return timestamp
-}
-
-// ToString converts time.Time to string.
-func (tc *TimeConverter) ToString(timestamp time.Time) string {
-	return timestamp.Format(time.RFC3339)
-}
-
-// SetTimestamp sets the current timestamp to the target.
-func SetTimestamp(target *string) {
-	var tc = &TimeConverter{}
-	var now = time.Now()
-	*target = tc.ToString(now)
-}
-
-func GetTime(timeStr string) time.Time {
-	var tc TimeConverter
-	return tc.FromString(timeStr)
-}
-
-func IsBlank(s *string) bool {
-	return s == nil || strings.TrimSpace(*s) == ""
 }
 
 // Checks whether it is possible to take savepoint.
@@ -242,25 +213,12 @@ func getPatch(cluster *v1beta1.FlinkCluster) ([]byte, error) {
 	return patch, err
 }
 
-func getNextRevisionNumber(revisions []*appsv1.ControllerRevision) int64 {
-	count := len(revisions)
-	if count <= 0 {
-		return 1
-	}
-	return revisions[count-1].Revision + 1
-}
-
 func getCurrentRevisionName(r *v1beta1.RevisionStatus) string {
 	return r.CurrentRevision[:strings.LastIndex(r.CurrentRevision, "-")]
 }
 
 func getNextRevisionName(r *v1beta1.RevisionStatus) string {
 	return r.NextRevision[:strings.LastIndex(r.NextRevision, "-")]
-}
-
-// Compose revision in FlinkClusterStatus with name and number of ControllerRevision
-func getRevisionWithNameNumber(cr *appsv1.ControllerRevision) string {
-	return fmt.Sprintf("%v-%v", cr.Name, cr.Revision)
 }
 
 func getRetryCount(data map[string]string) (string, error) {
@@ -292,7 +250,7 @@ func getControlStatus(controlName string, state string) *v1beta1.FlinkClusterCon
 	var controlStatus = new(v1beta1.FlinkClusterControlStatus)
 	controlStatus.Name = controlName
 	controlStatus.State = state
-	SetTimestamp(&controlStatus.UpdateTime)
+	util.SetTimestamp(&controlStatus.UpdateTime)
 	return controlStatus
 }
 
@@ -359,7 +317,7 @@ func isUserControlFinished(controlStatus *v1beta1.FlinkClusterControlStatus) boo
 
 // Check time has passed
 func hasTimeElapsed(timeToCheckStr string, now time.Time, intervalSec int) bool {
-	tc := &TimeConverter{}
+	tc := &util.TimeConverter{}
 	timeToCheck := tc.FromString(timeToCheckStr)
 	intervalPassedTime := timeToCheck.Add(time.Duration(int64(intervalSec) * int64(time.Second)))
 	return now.After(intervalPassedTime)
@@ -383,6 +341,10 @@ func isComponentUpdated(component runtime.Object, cluster *v1beta1.FlinkCluster)
 			return false
 		}
 	case *corev1.ConfigMap:
+		if o == nil {
+			return false
+		}
+	case *policyv1.PodDisruptionBudget:
 		if o == nil {
 			return false
 		}
@@ -421,6 +383,7 @@ func areComponentsUpdated(components []runtime.Object, cluster *v1beta1.FlinkClu
 func isUpdatedAll(observed ObservedClusterState) bool {
 	components := []runtime.Object{
 		observed.configMap,
+		observed.podDisruptionBudget,
 		observed.jmStatefulSet,
 		observed.tmStatefulSet,
 		observed.jmService,
@@ -437,6 +400,7 @@ func isClusterUpdateToDate(observed *ObservedClusterState) bool {
 	}
 	components := []runtime.Object{
 		observed.configMap,
+		observed.podDisruptionBudget,
 		observed.jmStatefulSet,
 		observed.tmStatefulSet,
 		observed.jmService,
@@ -489,20 +453,6 @@ func shouldUpdateCluster(observed *ObservedClusterState) bool {
 	return !job.IsActive() && observed.updateState == UpdateStateInProgress
 }
 
-func getNonLiveHistory(revisions []*appsv1.ControllerRevision, historyLimit int) []*appsv1.ControllerRevision {
-
-	history := append([]*appsv1.ControllerRevision{}, revisions...)
-	nonLiveHistory := make([]*appsv1.ControllerRevision, 0)
-
-	historyLen := len(history)
-	if historyLen <= historyLimit {
-		return nonLiveHistory
-	}
-
-	nonLiveHistory = append(nonLiveHistory, history[:(historyLen-historyLimit)]...)
-	return nonLiveHistory
-}
-
 func getFlinkJobDeploymentState(flinkJobState string) string {
 	switch flinkJobState {
 	case "INITIALIZING", "CREATED", "RUNNING", "FAILING", "CANCELLING", "RESTARTING", "RECONCILING", "SUSPENDED":
@@ -518,32 +468,9 @@ func getFlinkJobDeploymentState(flinkJobState string) string {
 	}
 }
 
-func getPodLogs(clientset *kubernetes.Clientset, pod *corev1.Pod) (string, error) {
-	if pod == nil {
-		return "", fmt.Errorf("no job pod found, even though submission completed")
-	}
-	pods := clientset.CoreV1().Pods(pod.Namespace)
-
-	req := pods.GetLogs(pod.Name, &corev1.PodLogOptions{})
-	podLogs, err := req.Stream(context.TODO())
-	if err != nil {
-		return "", fmt.Errorf("failed to get logs for pod %s: %v", pod.Name, err)
-	}
-	defer podLogs.Close()
-
-	buf := new(bytes.Buffer)
-	_, err = io.Copy(buf, podLogs)
-	if err != nil {
-		return "", fmt.Errorf("error in copy information from pod logs to buf")
-	}
-	str := buf.String()
-
-	return str, nil
-}
-
 // getFlinkJobSubmitLog extract logs from the job submitter pod.
 func getFlinkJobSubmitLog(clientset *kubernetes.Clientset, observedPod *corev1.Pod) (*SubmitterLog, error) {
-	log, err := getPodLogs(clientset, observedPod)
+	log, err := util.GetPodLogs(clientset, observedPod)
 	if err != nil {
 		return nil, err
 	}

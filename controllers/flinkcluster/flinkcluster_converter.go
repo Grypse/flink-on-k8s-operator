@@ -29,11 +29,13 @@ import (
 	v1beta1 "github.com/spotify/flink-on-k8s-operator/apis/flinkcluster/v1beta1"
 	"github.com/spotify/flink-on-k8s-operator/internal/flink"
 	"github.com/spotify/flink-on-k8s-operator/internal/model"
+	"github.com/spotify/flink-on-k8s-operator/internal/util"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -56,6 +58,7 @@ const (
 	jobPyFilesUriEnvVar     = "FLINK_JOB_PY_FILES_URI"
 	hadoopConfDirEnvVar     = "HADOOP_CONF_DIR"
 	gacEnvVar               = "GOOGLE_APPLICATION_CREDENTIALS"
+	maxUnavailableDefault   = "0%"
 )
 
 var (
@@ -86,7 +89,9 @@ func getDesiredClusterState(observed *ObservedClusterState) *model.DesiredCluste
 	if !shouldCleanup(cluster, "ConfigMap") {
 		state.ConfigMap = newConfigMap(cluster)
 	}
-
+	if !shouldCleanup(cluster, "PodDisruptionBudget") {
+		state.PodDisruptionBudget = newPodDisruptionBudget(cluster)
+	}
 	if !shouldCleanup(cluster, "JobManagerStatefulSet") && !applicationMode {
 		state.JmStatefulSet = newJobManagerStatefulSet(cluster)
 	}
@@ -107,7 +112,8 @@ func getDesiredClusterState(observed *ObservedClusterState) *model.DesiredCluste
 		jobStatus := cluster.Status.Components.Job
 
 		keepJobState := (shouldStopJob(cluster) || jobStatus.IsStopped()) &&
-			(!shouldUpdateJob(observed) && !jobStatus.ShouldRestart(jobSpec))
+			(!shouldUpdateJob(observed) && !jobStatus.ShouldRestart(jobSpec)) &&
+			shouldCleanup(cluster, "Job")
 
 		if !keepJobState {
 			state.Job = newJob(cluster)
@@ -143,7 +149,7 @@ func newJobManagerContainer(flinkCluster *v1beta1.FlinkCluster) *corev1.Containe
 		EnvFrom:         flinkCluster.Spec.EnvFrom,
 		VolumeMounts:    jobManagerSpec.VolumeMounts,
 		Lifecycle: &corev1.Lifecycle{
-			PreStop: &corev1.LifecycleHandler{
+			PreStop: &corev1.Handler{
 				Exec: &corev1.ExecAction{
 					Command: []string{"sleep", strconv.Itoa(preStopSleepSeconds)},
 				},
@@ -443,7 +449,7 @@ func newTaskMangerContainer(flinkCluster *v1beta1.FlinkCluster) *corev1.Containe
 		EnvFrom:         flinkCluster.Spec.EnvFrom,
 		VolumeMounts:    taskManagerSpec.VolumeMounts,
 		Lifecycle: &corev1.Lifecycle{
-			PreStop: &corev1.LifecycleHandler{
+			PreStop: &corev1.Handler{
 				Exec: &corev1.ExecAction{
 					Command: []string{"sleep", strconv.Itoa(preStopSleepSeconds)},
 				},
@@ -517,6 +523,35 @@ func newTaskManagerStatefulSet(flinkCluster *v1beta1.FlinkCluster) *appsv1.State
 					Annotations: taskManagerSpec.PodAnnotations,
 				},
 				Spec: *podSpec,
+			},
+		},
+	}
+}
+
+// Gets the desired PodDisruptionBudget.
+func newPodDisruptionBudget(flinkCluster *v1beta1.FlinkCluster) *policyv1.PodDisruptionBudget {
+	var jobSpec = flinkCluster.Spec.Job
+	if jobSpec == nil {
+		return nil
+	}
+	var clusterNamespace = flinkCluster.Namespace
+	var clusterName = flinkCluster.Name
+	var pdbName = getPodDisruptionBudgetName(clusterName)
+	var labels = getClusterLabels(flinkCluster)
+
+	var maxUnavailablePods = intstr.FromString(maxUnavailableDefault)
+
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:       clusterNamespace,
+			Name:            pdbName,
+			OwnerReferences: []metav1.OwnerReference{ToOwnerReference(flinkCluster)},
+			Labels:          labels,
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: &maxUnavailablePods,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
 			},
 		},
 	}
@@ -634,6 +669,12 @@ func newJobSubmitterPodSpec(flinkCluster *v1beta1.FlinkCluster) *corev1.PodSpec 
 
 	if jobSpec.Mode != nil && *jobSpec.Mode == v1beta1.JobModeDetached {
 		jobArgs = append(jobArgs, "--detached")
+	}
+
+	if jobSpec.ClassPath != nil && len(jobSpec.ClassPath) > 0 {
+		for _, u := range jobSpec.ClassPath {
+			jobArgs = append(jobArgs, "-C", u)
+		}
 	}
 
 	envVars := []corev1.EnvVar{{
@@ -773,21 +814,19 @@ func newJob(flinkCluster *v1beta1.FlinkCluster) *batchv1.Job {
 // case 3) When latest created savepoint is unavailable, use the savepoint from which current job was restored.
 func convertFromSavepoint(jobSpec *v1beta1.JobSpec, jobStatus *v1beta1.JobStatus, revision *v1beta1.RevisionStatus) *string {
 	switch {
-	// Creating for the first time
-	case jobStatus == nil:
-		if !IsBlank(jobSpec.FromSavepoint) {
-			return jobSpec.FromSavepoint
-		}
-		return nil
 	// Updating with FromSavepoint provided
-	case revision.IsUpdateTriggered() && !IsBlank(jobSpec.FromSavepoint):
+	case revision.IsUpdateTriggered() && !util.IsBlank(jobSpec.FromSavepoint):
 		return jobSpec.FromSavepoint
 	// Latest savepoint
-	case jobStatus.SavepointLocation != "":
+	case jobStatus != nil && jobStatus.SavepointLocation != "":
 		return &jobStatus.SavepointLocation
 	// The savepoint from which current job was restored
-	case jobStatus.FromSavepoint != "":
+	case jobStatus != nil && jobStatus.FromSavepoint != "":
 		return &jobStatus.FromSavepoint
+	}
+	// Creating for the first time or other situation
+	if !util.IsBlank(jobSpec.FromSavepoint) {
+		return jobSpec.FromSavepoint
 	}
 	return nil
 }
@@ -899,10 +938,8 @@ func getJobManagerIngressHost(ingressHostFormat string, clusterName string) stri
 
 // Checks whether the component should be deleted according to the cleanup
 // policy. Always return false for session cluster.
-func shouldCleanup(
-	cluster *v1beta1.FlinkCluster, component string) bool {
+func shouldCleanup(cluster *v1beta1.FlinkCluster, component string) bool {
 	var jobStatus = cluster.Status.Components.Job
-
 	// Session cluster.
 	if jobStatus == nil {
 		return false
